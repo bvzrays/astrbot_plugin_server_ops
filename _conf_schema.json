@@ -1,4 +1,14 @@
 {
+    "agent_name": {
+        "description": "Agent 的名字，用于个性化 System Prompt（例如 Jarvis, Aria）",
+        "type": "string",
+        "default": "OpsBot"
+    },
+    "agent_workspace": {
+        "description": "Agent 的本地工作空间路径，用于存储 MEMORY.md、HISTORY.md、skills/ 等文件。默认为插件数据目录。",
+        "type": "string",
+        "default": ""
+    },
     "ssh_host": {
         "description": "服务器 IP 或域名",
         "type": "string",
@@ -29,10 +39,15 @@
         "type": "string",
         "default": ""
     },
-    "max_steps": {
-        "description": "Agent 最大工具执行步数（防止无限循环）",
+    "max_iterations": {
+        "description": "Agent 每次会话的最大工具调用步数，防止无限循环。对应 Nanobot max_iterations。",
         "type": "int",
-        "default": 15
+        "default": 40
+    },
+    "memory_window": {
+        "description": "会话消息超过此数量时触发 LLM 记忆聚合，将历史压缩写入 MEMORY.md。",
+        "type": "int",
+        "default": 50
     },
     "cmd_default_timeout": {
         "description": "普通 Shell 命令的超时时间（秒）",
@@ -40,33 +55,48 @@
         "default": 30
     },
     "install_timeout": {
-        "description": "软件安装命令的超时时间（秒），适用于 install_package 工具",
+        "description": "软件安装命令的超时时间（秒）",
         "type": "int",
         "default": 600
     },
     "output_max_chars": {
-        "description": "工具返回内容的最大字符数（超出部分截断）",
+        "description": "工具返回内容的最大字符数（超出截断）",
         "type": "int",
-        "default": 3000
+        "default": 4000
     },
-    "show_thought": {
-        "description": "是否展示 Agent 每步的思考过程",
-        "type": "bool",
-        "default": true
-    },
-    "allowed_users": {
-        "description": "允许使用的用户 ID 白名单（英文逗号分隔，空=仅管理员）",
+    "web_search_api_key": {
+        "description": "Brave Search API Key，用于 web_search 工具。申请：https://brave.com/search/api/",
         "type": "string",
         "default": ""
     },
-    "history_max_turns": {
-        "description": "持续会话记忆的最多对话轮数",
+    "web_fetch_max_chars": {
+        "description": "web_fetch 工具返回的最大文章字符数",
         "type": "int",
-        "default": 10
+        "default": 10000
     },
-    "render_file_as_image": {
-        "description": "/ops_cat 命令是否将文件内容渲染为图片（关闭则发纯文字）",
+    "allowed_users": {
+        "description": "允许使用 /ops 的用户 ID 白名单（英文逗号分隔，空=仅管理员）",
+        "type": "string",
+        "default": ""
+    },
+    "allowed_groups": {
+        "description": "允许在哪些群组使用 /ops（英文逗号分隔，空=不限制）",
+        "type": "string",
+        "default": ""
+    },
+    "show_progress": {
+        "description": "是否在 Agent 执行每步工具时发送进度消息",
         "type": "bool",
         "default": true
+    },
+    "render_file_as_image": {
+        "description": "/ops_cat 和 /ops_ls 命令是否将输出渲染为图片（关闭则发纯文字）",
+        "type": "bool",
+        "default": true
+    },
+    "history_max_turns": {
+        "description": "每次 /ops 调用时注入的最多历史对话轮数",
+        "type": "int",
+        "default": 20
     }
 }

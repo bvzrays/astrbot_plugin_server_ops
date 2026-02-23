@@ -1,1 +1,3 @@
 asyncssh
+httpx
+pyyaml

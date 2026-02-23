@@ -1,360 +1,371 @@
 import re
-import traceback
+import asyncio
+from pathlib import Path
+
+from astrbot.api.star import Star, register
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
-from astrbot.core.agent.tool import ToolSet
+from astrbot.api import logger, ToolSet
+from astrbot.api.all import Context
+import astrbot.api.message_components as Comp
 from astrbot.core.agent.hooks import BaseAgentRunHooks
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool
-from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
-from astrbot.core.provider.entities import ProviderRequest
-from astrbot.core.agent.message import Message
-from astrbot.core.astr_agent_context import AgentContextWrapper, AstrAgentContext
-from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
-from .tools_config import (
-    ExecuteShellTool, ReadFileTool, WriteFileTool, InstallPackageTool,
-    RenderOutputTool, LearnSkillTool, ListSkillsTool
+from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.message.message_event_result import MessageChain
+
+# Core architecture
+from .core.ssh import AsyncSSHManager
+from .core.context_builder import ContextBuilder
+from .core.memory import MemoryStore
+
+# Tools (all @dataclass + run(event, ...) AstrBot API)
+from .tools.shell_tools import ExecuteShellTool, InstallPackageTool
+from .tools.file_tools import ReadFileTool, WriteFileTool
+from .tools.media_tools import DownloadToServerTool
+from .tools.memory_tools import (
+    LearnSkillTool, ListSkillsTool, UpdateMemoryTool, SearchHistoryTool
 )
+from .tools.visual_tools import RenderOutputTool
+from .tools.web_tools import WebSearchTool, WebFetchTool
 
-class OpsAgentHooks(BaseAgentRunHooks):
-    """
-    运维 Agent 的运行时钩子，优化 v3.1：兼顾降噪与进度反馈。
-    """
-    def __init__(self, event: AstrMessageEvent, show_thought: bool = True):
-        self.event = event
-        self.show_thought = show_thought
+# Utils
+from .utils.renderer import Renderer
 
-    async def on_tool_start(self, run_context: ContextWrapper, tool: FunctionTool, tool_args: dict | None) -> None:
-        # v3 降噪反馈：只发送一条简洁的执行状态
-        msg = f"⚙️ 正在执行：{tool.name}"
-        # 尝试从描述中提取更友好的人文描述
-        if "检查" in tool.description: msg = "🔍 正在检查服务器状态..."
-        elif "安装" in tool.description: msg = "📦 正在安装组件..."
-        elif "写入" in tool.description: msg = "📝 正在更新配置文件..."
-        elif "读取" in tool.description: msg = "📖 正在读取系统文件..."
-        elif "render" in tool.name: msg = "🎨 正在生成并渲染执行截图..."
-        elif "learn" in tool.name: msg = "🧠 正在将此操作步骤记入长期记忆..."
-        
-        await self.event.send(self.event.plain_result(msg))
 
-    async def on_tool_end(self, run_context: ContextWrapper, tool: FunctionTool, tool_args: dict | None, tool_result: any) -> None:
-        # v3 降噪：结束时不发独立消息
-        pass
+class OpsProgressHooks(BaseAgentRunHooks[AstrAgentContext]):
+    """Sends tool call progress messages to the QQ chat."""
 
-@register("astrbot_plugin_server_ops", "bvzrays", "基于 LLM 的远程服务器运维 Agent", "1.1.0")
+    # Map tool name → emoji
+    _ICONS = {
+        "execute_shell": "⚡",
+        "install_package": "📦",
+        "read_file": "📖",
+        "write_file": "✏️",
+        "download_to_server": "⬇️",
+        "render_output": "🖼️",
+        "update_memory": "🧠",
+        "search_history": "🔍",
+        "learn_skill": "📚",
+        "list_skills": "📋",
+        "web_search": "🌐",
+        "web_fetch": "🌐",
+    }
+
+    async def on_tool_start(self, run_context, tool, tool_args: dict):
+        event = run_context.context.event
+        icon = self._ICONS.get(tool.name, "🔨")
+        lines = [f"{icon} 调用工具: **{tool.name}**"]
+        # Show key arg as a hint
+        hint_key = next(
+            (k for k in ("command", "filepath", "query", "url", "skill_name") if k in tool_args),
+            None,
+        )
+        if hint_key and tool_args[hint_key]:
+            val = str(tool_args[hint_key])[:150]
+            lines.append(f"```\n{val}\n```")
+        try:
+            await event.send(MessageChain().message("\n".join(lines)))
+        except Exception:
+            pass  # Never let hooks crash the agent
+
+
+@register("astrbot_plugin_server_ops", "bvzrays", "模块化服务器运维 AI Agent (Nanobot 架构)", "3.0.0")
 class ServerOpsPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
-        self.ssh_mgr = None
+        self.config = config or {}
+        self.ssh_mgr: "AsyncSSHManager | None" = None
+        self._ctx_builder: "ContextBuilder | None" = None
 
     async def terminate(self):
-        """摧毁插件实例时关闭 SSH 连接"""
-        if self.ssh_mgr and self.ssh_mgr._conn:
-            self.ssh_mgr._conn.close()
-            await self.ssh_mgr._conn.wait_closed()
+        if self.ssh_mgr and getattr(self.ssh_mgr, '_conn', None):
+            try:
+                self.ssh_mgr._conn.close()
+                await self.ssh_mgr._conn.wait_closed()
+            except Exception:
+                pass
             self.ssh_mgr._conn = None
 
-    async def _check_permission(self, event: AstrMessageEvent, config: dict) -> bool:
-        """检查用户权限：管理员或白名单"""
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _get_workspace(self) -> Path:
+        ws_raw = self.config.get("agent_workspace", "").strip()
+        if ws_raw:
+            return Path(ws_raw)
+        try:
+            return Path(self.context.get_data_dir()) / "server_ops_workspace"
+        except Exception:
+            return Path("data/server_ops_workspace")
+
+    def _init_ssh(self):
+        if not self.ssh_mgr:
+            self.ssh_mgr = AsyncSSHManager(
+                host=self.config.get("ssh_host", "127.0.0.1"),
+                port=self.config.get("ssh_port", 22),
+                username=self.config.get("ssh_username", "root"),
+                password=self.config.get("ssh_password"),
+                key_path=self.config.get("ssh_key_path"),
+                passphrase=self.config.get("ssh_key_passphrase"),
+                default_timeout=self.config.get("cmd_default_timeout", 30),
+                output_max_chars=self.config.get("output_max_chars", 4000),
+            )
+
+    def _check_permission(self, event: AstrMessageEvent) -> bool:
         if event.is_admin():
             return True
-        allowed = config.get("allowed_users", "").strip()
-        if allowed:
-            allowed_list = [uid.strip() for uid in allowed.split(",")]
-            if str(event.get_sender_id()) in allowed_list:
-                return True
-        return False
+        uid = str(event.get_sender_id())
+        allowed = [u.strip() for u in self.config.get("allowed_users", "").split(",") if u.strip()]
+        return not allowed or uid in allowed
 
-    async def _get_ops_config(self):
-        metadata = self.context.get_registered_star("astrbot_plugin_server_ops")
-        config = metadata.config if metadata and metadata.config else {}
-        if not config:
-            config = self.context.get_config()
-        return config
+    def _make_tool(self, cls, workspace, **extra):
+        """Construct a tool and inject context."""
+        t = cls()
+        t.ssh_mgr = self.ssh_mgr
+        t.plugin = self
+        t.workspace = workspace
+        for k, v in extra.items():
+            setattr(t, k, v)
+        return t
 
-    async def _init_ssh(self, config, force=False):
-        if not self.ssh_mgr or force:
-            self.ssh_mgr = AsyncSSHManager(
-                host=config.get("ssh_host", "127.0.0.1"),
-                port=config.get("ssh_port", 22),
-                username=config.get("ssh_username", "root"),
-                password=config.get("ssh_password"),
-                key_path=config.get("ssh_key_path"),
-                passphrase=config.get("ssh_key_passphrase"),
-                default_timeout=config.get("cmd_default_timeout", 30),
-                output_max_chars=config.get("output_max_chars", 3000)
-            )
-        return self.ssh_mgr
+    def _build_toolset(self, workspace: Path) -> ToolSet:
+        mk = lambda cls, **kw: self._make_tool(cls, workspace, **kw)
+        tools = [
+            mk(ExecuteShellTool),
+            mk(InstallPackageTool),
+            mk(ReadFileTool),
+            mk(WriteFileTool),
+            mk(DownloadToServerTool),
+            mk(RenderOutputTool),
+            mk(UpdateMemoryTool),
+            mk(SearchHistoryTool),
+            mk(LearnSkillTool),
+            mk(ListSkillsTool),
+            mk(WebFetchTool, max_chars=self.config.get("web_fetch_max_chars", 10000)),
+        ]
+        web_key = self.config.get("web_search_api_key", "").strip()
+        if web_key:
+            tools.append(mk(WebSearchTool, api_key=web_key))
+        return ToolSet(tools)
+
+    async def _extract_image_urls(self, event: AstrMessageEvent):
+        urls = []
+        try:
+            for seg in event.get_messages():
+                if isinstance(seg, Comp.Image):
+                    url = getattr(seg, 'url', None) or getattr(seg, 'file', None)
+                    if url and str(url).startswith("http"):
+                        urls.append(str(url))
+        except Exception:
+            pass
+        return urls
+
+    # ------------------------------------------------------------------ #
+    #  /ops — Main Agent Command                                           #
+    # ------------------------------------------------------------------ #
 
     @filter.command("ops")
     async def ops(self, event: AstrMessageEvent):
-        """通过自然语言执行运维任务。"""
-        logger.debug(f"Ops command triggered with message: {event.message_str}")
-        config = await self._get_ops_config()
-        if not await self._check_permission(event, config):
-            yield event.plain_result("抱歉，您没有使用运维 Agent 的权限。")
+        """通过自然语言执行服务器运维任务。"""
+        if not self._check_permission(event):
+            yield event.plain_result("❌ 你没有使用运维 Agent 的权限。")
             return
 
-        # 彻底剥离指令前缀和指令名
         query = re.sub(r'^([/*!]\s*)?ops\s*', '', event.message_str, flags=re.IGNORECASE).strip()
         if not query:
-            yield event.plain_result("请输入运维任务描述，例如：/ops 查看系统负载")
+            yield event.plain_result("请输入任务，如：/ops 检查 nginx 状态")
             return
 
-        # 初始化 SSH 连接
-        self.ssh_mgr = await self._init_ssh(config)
-        yield event.plain_result(f"🚀 运维 Agent 已启动：{query}")
+        self._init_ssh()
+        workspace = self._get_workspace()
+        workspace.mkdir(parents=True, exist_ok=True)
 
-        # 背景知识：加载已学习的 Skills
-        skills = await self.get_kv_data("ops_skills", {})
-        skills_prompt = ""
-        if skills:
-            skills_prompt = "\n\n你已掌握的特定操作技能（Skill Memory）：\n"
-            for name, content in skills.items():
-                skills_prompt += f"### {name}\n{content}\n\n"
+        agent_name = self.config.get("agent_name", "OpsBot")
 
-        # System Prompt 设定 (v3.2 全能增强版)
-        system_prompt = (
-            "你是一个极简、高效的远程服务器运维专家。你被集成在 AstrBot 平台中。\n"
-            "你的唯一任务是：使用提供的 SSH 工具**立即**执行操作，严禁废话。\n\n"
-            "核心指令：\n"
-            "1. **行动优先**：收到任务后，你必须在第一回合就调用工具。\n"
-            "2. **可视化优先**：当任务涉及展示目录结构(如ls -R)或查看多行日志(如tail)时，必须优先使用 `render_output` 工具将其渲染为图片，而不是发送长文字。\n"
-            "3. **长期记忆**：当你完成了一个相对复杂或用户明确要求的任务后，应主动调用 `learn_skill` 工具将关键步骤记入你的记忆库。\n"
-            "4. **探针逻辑**：如果不确定服务器状态，先用探测工具调研再做决策。\n"
-            "5. **简洁反馈**：每一个回合，你只需要给出一句非常简短的当前动作说明，然后立即调用工具。\n"
-            f"{skills_prompt}"
+        # Build context & system prompt via ContextBuilder
+        if not self._ctx_builder:
+            self._ctx_builder = ContextBuilder(workspace, agent_name=agent_name)
+
+        ops_skills = await self.get_kv_data("ops_skills", {})
+        extra = ""
+        if ops_skills:
+            extra = "## Remembered Workflows\n" + "\n".join(
+                f"- **{k}**: {v}" for k, v in ops_skills.items()
+            )
+        system_prompt = self._ctx_builder.build_system_prompt(
+            ssh_host=self.config.get("ssh_host", ""),
+            ssh_user=self.config.get("ssh_username", ""),
+            extra_context=extra,
         )
 
-        # 准备工具集
-        tools = ToolSet([
-            ExecuteShellTool(ssh_mgr=self.ssh_mgr),
-            ReadFileTool(ssh_mgr=self.ssh_mgr),
-            WriteFileTool(ssh_mgr=self.ssh_mgr),
-            InstallPackageTool(ssh_mgr=self.ssh_mgr, install_timeout=config.get("install_timeout", 600)),
-            RenderOutputTool(ssh_mgr=self.ssh_mgr, plugin=self),
-            LearnSkillTool(plugin=self),
-            ListSkillsTool(plugin=self)
-        ])
+        # Build ToolSet
+        tool_set = self._build_toolset(workspace)
+
+        # Image URLs for vision LLMs
+        image_urls = await self._extract_image_urls(event)
+
+        umo = event.unified_msg_origin
+
+        # Get provider ID
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(umo)
+        except Exception as e:
+            yield event.plain_result(f"❌ 无法获取 LLM 提供商：{e}\n请先在 AstrBot 中配置模型。")
+            return
+
+        yield event.plain_result(f"🚀 {agent_name} 启动：{query}")
 
         try:
-            # 3. 持续会话隔离：使用 ops_history 前缀
-            user_id = event.get_sender_id()
-            history_key = f"ops_history_{user_id}"
-            history_data = await self.get_kv_data(history_key, []) or []
-            
-            messages = []
-            for m in history_data:
-                if m.get('role') == 'user':
-                    messages.append(Message(role='user', content=m['content']))
-
-            hooks = OpsAgentHooks(event, show_thought=config.get("show_thought", True))
-            umo = event.unified_msg_origin
-            prov_id = await self.context.get_current_chat_provider_id(umo)
-            prov = await self.context.provider_manager.get_provider_by_id(prov_id)
-            
-            agent_context = AstrAgentContext(context=self.context, event=event)
-            agent_runner = ToolLoopAgentRunner()
-            tool_executor = FunctionToolExecutor()
-            
-            await agent_runner.reset(
-                provider=prov,
-                request=ProviderRequest(
-                    system_prompt=system_prompt,
-                    prompt=query,
-                    contexts=messages,
-                    func_tool=tools 
-                ),
-                run_context=AgentContextWrapper(
-                    context=agent_context,
-                    tool_call_timeout=config.get("agent_timeout", 60),
-                ),
-                tool_executor=tool_executor,
-                agent_hooks=hooks
+            # ── THE KEY FIX: use AstrBot's built-in tool loop agent ──────────
+            # This handles: LLM call → detect tool_calls → execute → feed back → repeat
+            show_progress = self.config.get("show_progress", True)
+            llm_resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=query,
+                image_urls=image_urls if image_urls else [],
+                tools=tool_set,
+                system_prompt=system_prompt,
+                max_steps=self.config.get("max_iterations", 40),
+                tool_call_timeout=self.config.get("cmd_default_timeout", 60),
+                # Pass custom hooks → sends progress msgs to QQ chat
+                agent_hooks=OpsProgressHooks() if show_progress else None,
             )
 
-            async for resp in agent_runner.step_until_done(config.get("max_steps", 15)):
-                if resp.type == "llm_result":
-                    content = resp.data["chain"].get_plain_text().strip()
-                    if not content: continue
-                    is_final = agent_runner.done() or any(kw in content for kw in ["完成", "总结", "已经", "成功", "失败"])
-                    if is_final:
-                        yield event.plain_result(f"🏁 任务总结:\n{content}")
-                    else:
-                        yield event.plain_result(f"💡 Agent：{content}")
+            if llm_resp and llm_resp.completion_text:
+                yield event.plain_result(llm_resp.completion_text)
+            elif not llm_resp:
+                yield event.plain_result("⚠️ Agent 未返回最终响应。")
 
-            # 4. 保存对话历史
-            current_msgs = agent_runner.run_context.messages
-            new_history = [{"role": m.role, "content": (m.content[0].text if isinstance(m.content, list) else str(m.content))} 
-                           for m in current_msgs if m.role in ["user", "assistant"]]
-            
-            max_turns = config.get("history_max_turns", 10)
-            if len(new_history) > max_turns * 2: new_history = new_history[-(max_turns * 2):]
-            await self.put_kv_data(history_key, new_history)
+            # Background memory consolidation
+            asyncio.create_task(self._maybe_consolidate(umo, workspace))
 
         except Exception as e:
-            logger.error(f"Ops Agent Error: {traceback.format_exc()}")
-            yield event.plain_result(f"❌ 运维执行出错: {str(e)}")
+            logger.exception(f"[ServerOps] ops error: {e}")
+            yield event.plain_result(f"❌ 执行异常: {e}")
 
-    @filter.command("ops_clear")
-    async def ops_clear(self, event: AstrMessageEvent):
-        """清空当前运维会话的历史记忆。"""
-        user_id = event.get_sender_id()
-        history_key = f"ops_history_{user_id}"
-        await self.put_kv_data(history_key, [])
-        yield event.plain_result("✅ 运维对话隔离记忆已清空。")
-
-    @filter.command("ops_test")
-    async def ops_test(self, event: AstrMessageEvent):
-        """测试 SSH 连接并返回详细诊断。"""
-        config = await self._get_ops_config()
-        if not await self._check_permission(event, config):
-            yield event.plain_result("无权限。")
-            return
-        
-        yield event.plain_result(f"🔍 正在启动 SSH 连接诊断 (Target: {config.get('ssh_host')})...\n(注: 为了兼容性，已强制仅使用密码认证并延长握手等待时间)")
-        
+    async def _maybe_consolidate(self, umo: str, workspace: Path):
+        """Consolidate conversation history to MEMORY.md if threshold reached."""
         try:
-            ssh = await self._init_ssh(config, force=True)
-            status, stdout, stderr = await ssh.execute_command("echo 'SSH_TEST_SUCCESS'")
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not curr_cid:
+                return
+            conversation = await conv_mgr.get_conversation(umo, curr_cid)
+            if not conversation:
+                return
+            import json
+            history = json.loads(conversation.history or "[]")
+            mem_window = self.config.get("memory_window", 50)
+            if len(history) < mem_window:
+                return
+            store = MemoryStore(workspace)
+            provider = self.context.get_using_provider(umo)
+            if provider:
+                await store.consolidate(history, provider, "")
+                logger.info("[ServerOps] Memory consolidation complete.")
         except Exception as e:
-            status, stdout, stderr = -1, "", str(e)
+            logger.warning(f"[ServerOps] Memory consolidation error: {e}")
 
-        if status == 0 and "SSH_TEST_SUCCESS" in stdout:
-            yield event.plain_result("✅ SSH 连接成功！服务器响应正常。")
-        else:
-            diag_msg = f"❌ SSH 连接失败。\n\n[精细化诊断]:\n{stderr}\n\n[配置盘点]:\n- Host: {config.get('ssh_host')}\n- Port: {config.get('ssh_port')}\n- User: {config.get('ssh_username')}\n- Auth: Password"
-            yield event.plain_result(diag_msg)
+    # ------------------------------------------------------------------ #
+    #  Utility commands                                                    #
+    # ------------------------------------------------------------------ #
 
-    def _render_vs_code_style(self, title: str, content: str, subtitle: str = "") -> str:
-        """统一渲染 VS Code 风格的 HTML"""
-        return f"""
-        <div style="background: #1e1e1e; color: #d4d4d4; padding: 15px; font-family: 'Segoe UI', 'Consolas', monospace; border-radius: 8px; border: 1px solid #333; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
-            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 8px; margin-bottom: 12px;">
-                <span style="color: #4ec9b0; font-weight: bold; font-size: 13px;">{title}</span>
-                <span style="color: #6a9955; font-size: 11px;">{subtitle}</span>
-            </div>
-            <pre style="margin: 0; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; line-height: 1.5;">{content}</pre>
-        </div>
-        """
-
-    @filter.command("ops_cat")
-    async def ops_cat(self, event: AstrMessageEvent):
-        """查看服务器文件内容并渲染为图片。用法：/ops_cat <路径>"""
-        logger.debug(f"Ops_cat triggered with message: {event.message_str}")
-        config = await self._get_ops_config()
-        if not await self._check_permission(event, config):
-            yield event.plain_result("无权限。")
-            return
-        
-        path = event.message_str
-        for prefix_cmd in ["/ops_cat", "*ops_cat", "!ops_cat", "ops_cat"]:
-            if path.startswith(prefix_cmd):
-                path = path[len(prefix_cmd):].strip()
-                break
-                
-        if not path:
-            yield event.plain_result("请输入文件路径。")
-            return
-        
-        ssh = await self._init_ssh(config)
-        content = await ssh.read_file(path)
-        
-        if config.get("render_file_as_image", True):
-            img_url = await self.html_render(self._render_vs_code_style(f"📄 {path}", content, "File Viewer"), {})
+    async def _render_and_send(self, event, title, content, mode):
+        renderer = Renderer()
+        tmpl, data = renderer.build_template(title, content, mode)
+        try:
+            img_url = await self.html_render(
+                tmpl, data,
+                options={"full_page": False, "scale": "device"}
+            )
             yield event.image_result(img_url)
-        else:
-            yield event.plain_result(f"文件内容 ({path}):\n{content}")
+        except Exception:
+            yield event.plain_result(content[:2000])
 
     @filter.command("ops_ls")
     async def ops_ls(self, event: AstrMessageEvent):
-        """查看服务器目录结构。用法：/ops_ls [路径]"""
-        logger.debug(f"Ops_ls triggered with message: {event.message_str}")
-        config = await self._get_ops_config()
-        if not await self._check_permission(event, config):
-            yield event.plain_result("无权限。")
-            return
-        
-        path = event.message_str
-        for prefix_cmd in ["/ops_ls", "*ops_ls", "!ops_ls", "ops_ls"]:
-            if path.startswith(prefix_cmd):
-                path = path[len(prefix_cmd):].strip()
-                break
-        path = path or "."
-        ssh = await self._init_ssh(config)
-        
-        # 使用 ls -F 获取带标识的列表
-        status, stdout, stderr = await ssh.execute_command(f"ls -F --color=never {path}")
+        path = re.sub(r'^([/*!]\s*)?ops_ls\s*', '', event.message_str, flags=re.IGNORECASE).strip() or "."
+        self._init_ssh()
+        status, stdout, stderr = await self.ssh_mgr.execute_command(f"ls -F {path}")
         if status != 0:
-            yield event.plain_result(f"错误: {stderr}")
+            yield event.plain_result(f"Error: {stderr}")
             return
+        async for msg in self._render_and_send(event, f"📂 {path}", stdout, "tree"):
+            yield msg
 
-        lines = stdout.strip().split('\n')
-        formatted_list = ""
-        for line in lines:
-            if not line: continue
-            if line.endswith('/'):
-                formatted_list += f"<span style='color: #dcb67a;'>📁 {line}</span>\n"
-            elif line.endswith('*'):
-                formatted_list += f"<span style='color: #b5cea8;'>🚀 {line}</span>\n"
-            elif line.endswith('@'):
-                formatted_list += f"<span style='color: #4fc1ff;'>🔗 {line}</span>\n"
-            else:
-                formatted_list += f"<span style='color: #d4d4d4;'>📄 {line}</span>\n"
-
-        img_url = await self.html_render(self._render_vs_code_style(f"📂 Explorer: {path}", formatted_list, "Directory Tree"), {})
-        yield event.image_result(img_url)
-
-    @filter.command("ops_log")
-    async def ops_log(self, event: AstrMessageEvent):
-        """查看并渲染当前会话的历史操作记录。"""
-        logger.debug(f"Ops_log triggered with message: {event.message_str}")
-        user_id = event.get_sender_id()
-        history_key = f"ops_history_{user_id}"
-        history_data = await self.get_kv_data(history_key, [])
-        
-        if not history_data:
-            yield event.plain_result("当前没有历史记录。")
+    @filter.command("ops_cat")
+    async def ops_cat(self, event: AstrMessageEvent):
+        path = re.sub(r'^([/*!]\s*)?ops_cat\s*', '', event.message_str, flags=re.IGNORECASE).strip()
+        if not path:
+            yield event.plain_result("用法：/ops_cat <路径>")
             return
-        
-        log_content = ""
-        for m in history_data:
-            role_color = "#569cd6" if m['role'] == 'user' else "#ce9178"
-            role_name = "USER" if m['role'] == 'user' else "AGENT"
-            log_content += f"<div style='margin-bottom: 8px;'><b style='color: {role_color}'>{role_name}></b> {m['content']}</div>"
+        self._init_ssh()
+        content = await self.ssh_mgr.read_file(path)
+        async for msg in self._render_and_send(event, f"📄 {path}", content, "plain"):
+            yield msg
 
-        img_url = await self.html_render(self._render_vs_code_style(f"🕒 Session History", log_content, str(user_id)), {})
-        yield event.image_result(img_url)
+    @filter.command("ops_memory")
+    async def ops_memory(self, event: AstrMessageEvent):
+        """查看 Agent 的长期记忆（MEMORY.md）。"""
+        store = MemoryStore(self._get_workspace())
+        mem = store.read_memory()
+        if not mem:
+            yield event.plain_result("📭 记忆库为空。")
+            return
+        async for msg in self._render_and_send(event, "🧠 Long-term Memory", mem, "plain"):
+            yield msg
 
     @filter.command("ops_skills")
     async def ops_skills(self, event: AstrMessageEvent):
-        """列出所有已学到的运维技能。"""
-        skills = await self.get_kv_data("ops_skills", {})
-        if not skills:
-            yield event.plain_result("🧠 目前还没有学习到任何技能。你可以通过 /ops 指令让 Agent 学习。")
+        """查看所有技能（SKILL.md + KV skills）。"""
+        ws = self._get_workspace()
+        from .core.skills import SkillsLoader
+        loader = SkillsLoader(ws)
+        file_skills = loader.list_skills()
+        kv_skills = await self.get_kv_data("ops_skills", {})
+
+        lines = []
+        if file_skills:
+            lines.append("## SKILL.md 技能")
+            for s in file_skills:
+                meta = loader.get_skill_metadata(s["name"])
+                lines.append(f"- **{s['name']}** [{s['source']}]: {meta.get('description', '')}")
+        if kv_skills:
+            lines.append("\n## KV 记忆技能")
+            for k in kv_skills:
+                lines.append(f"- **{k}**")
+
+        if not lines:
+            yield event.plain_result("技能库为空。")
             return
-        
-        content = ""
-        for name, detail in skills.items():
-            content += f"### {name}\n{detail}\n\n"
-        
-        img_url = await self.html_render(self._render_vs_code_style("🧠 已学技能库", content, "Skill Memory"), {})
-        yield event.image_result(img_url)
+        async for msg in self._render_and_send(event, "📚 Skills Library", "\n".join(lines), "plain"):
+            yield msg
 
     @filter.command("ops_forget")
     async def ops_forget(self, event: AstrMessageEvent):
-        """忘掉某个已学的技能。用法：/ops_forget <技能名>"""
         name = re.sub(r'^([/*!]\s*)?ops_forget\s*', '', event.message_str, flags=re.IGNORECASE).strip()
-        if not name:
-            yield event.plain_result("请输入要忘掉的技能名称。")
-            return
-        
         skills = await self.get_kv_data("ops_skills", {})
         if name in skills:
             del skills[name]
             await self.put_kv_data("ops_skills", skills)
-            yield event.plain_result(f"✅ 已从记忆中移除技能：{name}")
+            yield event.plain_result(f"✅ 已移除技能：{name}")
         else:
-            yield event.plain_result(f"⚠️ 找不到名为 '{name}' 的技能。")
+            yield event.plain_result(f"⚠️ 未找到技能：{name}")
 
+    @filter.command("ops_clear")
+    async def ops_clear(self, event: AstrMessageEvent):
+        """在 AstrBot 中新建一条对话（清除上下文）。"""
+        umo = event.unified_msg_origin
+        conv_mgr = self.context.conversation_manager
+        await conv_mgr.new_conversation(umo)
+        yield event.plain_result("✅ 已开启新对话，上下文已重置。")
+
+    @filter.command("ops_test")
+    async def ops_test(self, event: AstrMessageEvent):
+        yield event.plain_result(f"🔍 测试 SSH 连接：{self.config.get('ssh_host', '(未配置)')}…")
+        try:
+            self._init_ssh()
+            await self.ssh_mgr._get_conn()
+            yield event.plain_result("✅ SSH 连接成功！")
+        except Exception as e:
+            yield event.plain_result(f"❌ 连接失败: {e}")

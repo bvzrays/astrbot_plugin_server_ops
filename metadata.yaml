@@ -1,6 +1,6 @@
 name: astrbot_plugin_server_ops
 display_name: Server Ops Agent
 desc: 基于 LLM 的远程服务器运维 Agent，支持可视化截图及 Skill 学习。
-version: v1.1.0
+version: v3.0.0
 author: bvzrays
 repo: https://github.com/bvzrays/astrbot_plugin_server_ops
