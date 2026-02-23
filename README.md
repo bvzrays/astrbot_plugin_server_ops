@@ -1,47 +1,63 @@
-# Server Ops Agent v3 🚀
+# AstrBot Server Ops Agent (v1.1.0)
 
-基于 LLM 的智能远程服务器运维助手，让您通过自然语言管理 Linux 服务器。
+基于 LLM 的远程服务器运维助手，通过自然语言对话即可实现复杂的 Linux 服务器管理。
 
-## ✨ v3.0 新特性
+## 🌟 核心特性
 
-1. **🔇 UX 降噪**：优化 Hook 逻辑，减少执行过程中的无用消息气泡，让对话更清爽。
-2. **🌳 视觉化目录树 (`/ops_ls`)**：新增指令，一键查看服务器文件夹结构，带图标和颜色区分。
-3. **🎨 统一 VS Code 风格**：所有图片渲染（文件查看、日志、目录树）均采用精致的 VS Code 深色主题。
-4. **🤖 智能提示词优化**：参考 GitHub Copilot 策略，Agent 现在更主动、更严谨，且会隐藏实现细节。
-5. **🛠️ 延续 v2 优势**：长超时安装、全自动确认、持续会话记忆。
+- **自然语言运维**：直接告诉 Bot "帮我看看系统负载"、"帮我安装 nginx" 或 "重启 docker 容器"。
+- **可视化输出**：自主识别输出长度和类型，将目录树 (`ls -R`)、长日志 (`tail`) 等渲染为精美图片发送。
+- **自主 Skill 学习**：Agent 会将复杂或常用的操作流程记入长期记忆，下次直接应用知识，无需重复探索。
+- **对话隔离系统**：运维对话记录与主聊天窗口完全隔离，支持独立清除和查看。
+- **零依赖配置**：无需在服务器端安装 Agent，仅需 SSH 访问权限，支持密码及私钥。
+- **高兼容性**：内置宽容算法集合，完美支持各类新旧 Linux 发行版（Ubuntu, CentOS, Debian 等）。
 
-## 📖 指令列表
+## 📸 功能演示
 
-| 指令 | 说明 | 示例 |
-| :--- | :--- | :--- |
-| `/ops <任务>` | 执行运维任务（核心指令） | `/ops 安装 nginx 并配置 80 端口` |
-| `/ops_ls [路径]` | 查看目录结构（带图标渲染） | `/ops_ls /var/www` |
-| `/ops_cat <路径>` | 查看文件内容（代码风格渲染） | `/ops_cat /etc/nginx/nginx.conf` |
-| `/ops_log` | 查看当前会话的操作记录图 | `/ops_log` |
-| `/ops_clear` | 清空会话记忆 | `/ops_clear` |
+### 1. 可视化渲染
+发送 `/ops 帮我看看网站根目录结构`，Bot 会返回一张带有文件夹和文件图标标注的树形结构图。
 
-## ⚙️ 配置项说明
+### 2. 技能记忆
+发送 `/ops 记住怎么检查 nginx 状态并重启`，之后发送 `/ops 查下 nginx` 时，Bot 将直接执行预记的指令。
 
-在 AstrBot 管理面板中进行配置：
+## 🛠️ 安装
 
-| 配置项 | 说明 | 默认值 |
-| :--- | :--- | :--- |
+1. 在 AstrBot 插件市场搜索 `astrbot_plugin_server_ops` 进行安装。
+2. 或在 `data/plugins` 目录下克隆本项目：
+   ```bash
+   git clone https://github.com/bvzrays/astrbot_plugin_server_ops.git
+   ```
+
+## ⚙️ 配置项
+
+| 配置名 | 描述 | 默认值 |
+|--------|------|--------|
 | `ssh_host` | 服务器 IP 或域名 | `127.0.0.1` |
-| `max_steps` | Agent 解决任务的最大尝试步数 | `15` |
-| `cmd_default_timeout` | 普通命令超时（秒） | `30` |
-| `install_timeout` | 安装任务专用超时（秒） | `600` |
-| `history_max_turns` | 对话记忆的最大轮数 | `10` |
-| `allowed_users` | 白名单 ID（逗号分隔） | `(空，仅限管理员)` |
-| `render_file_as_image` | 是否开启文件图片化渲染 | `true` |
+| `ssh_port` | SSH 端口 | `22` |
+| `ssh_username` | SSH 用户名 | `root` |
+| `ssh_password` | SSH 密码 | - |
+| `ssh_key_path` | 私钥文件绝对路径 | - |
+| `allowed_users` | 允许使用的用户 ID 白名单 | (仅管理员) |
 
-## 🚀 快速开始
+## ⌨️ 常用命令
 
-1. **安装**：将其放入插件目录并重启。
-2. **配置**：在管理面板设置 SSH 的 Host、User 和密码。
-3. **对话**：
-   - `/ops 帮我写一个简单的静态 HTML 博客放在 /var/www/html`
-   - `/ops 帮我安装 1panel`
-   - `/ops 检查一下刚才安装的状态`
+- `/ops <任务>`：启动运维 Agent 执行任务。
+- `/ops_test`：启动 SSH 连接诊断。
+- `/ops_skills`：查看已学到的技能库。
+- `/ops_forget <名称>`：遗忘特定技能。
+- `/ops_log`：查看隔离的运维历史记录。
+- `/ops_clear`：清空运维会话记忆。
+- `/ops_ls [路径]`：快速查看目录（带渲染）。
+- `/ops_cat <路径>`：快速查看文件内容（带渲染）。
+
+## 📝 更新日志
+
+### v1.1.0 (2026-02-23)
+- **[NEW]** 自主截图渲染：新增 `render_output` 工具，支持 `tree`/`log`/`plain` 三种可视化模式。
+- **[NEW]** 技能学习系统：新增 `LearnSkill` 工具，支持通过指令集长期记忆复杂操作。
+- **[NEW]** 对话隔离：运维历史记录 (`ops_history_`) 与全局历史完全物理隔离。
+- **[FIX]** SSH 重连 Bug：修复 `SSHClientConnection` 缺少 `is_closing` 属性导致的重连失败。
+- **[FIX]** 兼容性提升：引入宽容算法集合 (`_COMPAT_ALGS`)，解决部分服务器握手阶段 `Connection lost` 问题。
+- **[ENH]** 性能优化：更智能的连接存活检测 (`_is_conn_alive`)，大幅减少无效重连。
 
 ---
-*Powered by AstrBot*
+Produced by [bvzrays](https://github.com/bvzrays). Powered by [AstrBot](https://github.com/Soulter/AstrBot).

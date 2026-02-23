@@ -12,8 +12,10 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.agent.message import Message
 from astrbot.core.astr_agent_context import AgentContextWrapper, AstrAgentContext
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
-from .ssh_manager import AsyncSSHManager
-from .tools_config import ExecuteShellTool, ReadFileTool, WriteFileTool, InstallPackageTool
+from .tools_config import (
+    ExecuteShellTool, ReadFileTool, WriteFileTool, InstallPackageTool,
+    RenderOutputTool, LearnSkillTool, ListSkillsTool
+)
 
 class OpsAgentHooks(BaseAgentRunHooks):
     """
@@ -31,6 +33,8 @@ class OpsAgentHooks(BaseAgentRunHooks):
         elif "安装" in tool.description: msg = "📦 正在安装组件..."
         elif "写入" in tool.description: msg = "📝 正在更新配置文件..."
         elif "读取" in tool.description: msg = "📖 正在读取系统文件..."
+        elif "render" in tool.name: msg = "🎨 正在生成并渲染执行截图..."
+        elif "learn" in tool.name: msg = "🧠 正在将此操作步骤记入长期记忆..."
         
         await self.event.send(self.event.plain_result(msg))
 
@@ -38,7 +42,7 @@ class OpsAgentHooks(BaseAgentRunHooks):
         # v3 降噪：结束时不发独立消息
         pass
 
-@register("astrbot_plugin_server_ops", "bvzrays", "基于 LLM 的远程服务器运维 Agent", "1.0.0")
+@register("astrbot_plugin_server_ops", "bvzrays", "基于 LLM 的远程服务器运维 Agent", "1.1.0")
 class ServerOpsPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -89,38 +93,38 @@ class ServerOpsPlugin(Star):
         logger.debug(f"Ops command triggered with message: {event.message_str}")
         config = await self._get_ops_config()
         if not await self._check_permission(event, config):
-            yield event.plain_result("抱歉，您没有使用运维 Agent 的权限。请联系管理员添加您的 ID 到白名单。")
+            yield event.plain_result("抱歉，您没有使用运维 Agent 的权限。")
             return
-
-        # 2. 动态加载插件专门的配置
-        metadata = self.context.get_registered_star("astrbot_plugin_server_ops")
-        config = metadata.config if metadata and metadata.config else {}
-        if not config:
-            config = self.context.get_config()
 
         # 彻底剥离指令前缀和指令名
         query = re.sub(r'^([/*!]\s*)?ops\s*', '', event.message_str, flags=re.IGNORECASE).strip()
-        
         if not query:
             yield event.plain_result("请输入运维任务描述，例如：/ops 查看系统负载")
             return
 
         # 初始化 SSH 连接
         self.ssh_mgr = await self._init_ssh(config)
-
         yield event.plain_result(f"🚀 运维 Agent 已启动：{query}")
 
-        # System Prompt 设定 (v3.1 高压驱动版)
+        # 背景知识：加载已学习的 Skills
+        skills = await self.get_kv_data("ops_skills", {})
+        skills_prompt = ""
+        if skills:
+            skills_prompt = "\n\n你已掌握的特定操作技能（Skill Memory）：\n"
+            for name, content in skills.items():
+                skills_prompt += f"### {name}\n{content}\n\n"
+
+        # System Prompt 设定 (v3.2 全能增强版)
         system_prompt = (
             "你是一个极简、高效的远程服务器运维专家。你被集成在 AstrBot 平台中。\n"
             "你的唯一任务是：使用提供的 SSH 工具**立即**执行操作，严禁废话。\n\n"
             "核心指令：\n"
-            "1. **行动优先**：收到任务后，你必须在第一回合就调用工具。不要输出很长的计划或询问确认。\n"
-            "2. **探针逻辑**：如果不确定服务器状态，先用 `ls`, `ps`, `systemctl status` 或 `cat` 探测，再做决策。\n"
-            "3. **隐藏工具**：不要在回复中提到工具的名字。你可以说 '我正准备查看服务状态'，但不要说 '我要调用 execute_shell'。\n"
-            "4. **安装规范**：所有软件安装必须通过 `install_package` 工具完成，它能自动处理确认提示并支持长超时。\n"
+            "1. **行动优先**：收到任务后，你必须在第一回合就调用工具。\n"
+            "2. **可视化优先**：当任务涉及展示目录结构(如ls -R)或查看多行日志(如tail)时，必须优先使用 `render_output` 工具将其渲染为图片，而不是发送长文字。\n"
+            "3. **长期记忆**：当你完成了一个相对复杂或用户明确要求的任务后，应主动调用 `learn_skill` 工具将关键步骤记入你的记忆库。\n"
+            "4. **探针逻辑**：如果不确定服务器状态，先用探测工具调研再做决策。\n"
             "5. **简洁反馈**：每一个回合，你只需要给出一句非常简短的当前动作说明，然后立即调用工具。\n"
-            "6. **任务总结**：全部完成后，给出一个非常专业的总结回复，建议使用列表展示执行结果。\n"
+            f"{skills_prompt}"
         )
 
         # 准备工具集
@@ -128,24 +132,24 @@ class ServerOpsPlugin(Star):
             ExecuteShellTool(ssh_mgr=self.ssh_mgr),
             ReadFileTool(ssh_mgr=self.ssh_mgr),
             WriteFileTool(ssh_mgr=self.ssh_mgr),
-            InstallPackageTool(ssh_mgr=self.ssh_mgr, install_timeout=config.get("install_timeout", 600))
+            InstallPackageTool(ssh_mgr=self.ssh_mgr, install_timeout=config.get("install_timeout", 600)),
+            RenderOutputTool(ssh_mgr=self.ssh_mgr, plugin=self),
+            LearnSkillTool(plugin=self),
+            ListSkillsTool(plugin=self)
         ])
 
         try:
-            # 3. 持续会话能力：从 KV 库加载历史
+            # 3. 持续会话隔离：使用 ops_history 前缀
             user_id = event.get_sender_id()
-            history_key = f"history_{user_id}"
+            history_key = f"ops_history_{user_id}"
             history_data = await self.get_kv_data(history_key, []) or []
             
-            # 仅注入用户消息作为历史，避免 assistant 的"计划文字"污染新任务
             messages = []
             for m in history_data:
                 if m.get('role') == 'user':
                     messages.append(Message(role='user', content=m['content']))
 
-            # 实例化钩子
             hooks = OpsAgentHooks(event, show_thought=config.get("show_thought", True))
-            
             umo = event.unified_msg_origin
             prov_id = await self.context.get_current_chat_provider_id(umo)
             prov = await self.context.provider_manager.get_provider_by_id(prov_id)
@@ -154,8 +158,6 @@ class ServerOpsPlugin(Star):
             agent_runner = ToolLoopAgentRunner()
             tool_executor = FunctionToolExecutor()
             
-            # 运行 Agent (v3.1 修正版逻辑)
-            # 1. 重置运行上下文
             await agent_runner.reset(
                 provider=prov,
                 request=ProviderRequest(
@@ -172,38 +174,23 @@ class ServerOpsPlugin(Star):
                 agent_hooks=hooks
             )
 
-            # 2. 迭代执行步骤直到完成
-            async for resp in agent_runner.step_until_done(config.get("max_steps", 10)):
+            async for resp in agent_runner.step_until_done(config.get("max_steps", 15)):
                 if resp.type == "llm_result":
-                    chain = resp.data["chain"]
-                    content = chain.get_plain_text().strip()
+                    content = resp.data["chain"].get_plain_text().strip()
                     if not content: continue
-                    
-                    # 识别是否是任务完成的总结
                     is_final = agent_runner.done() or any(kw in content for kw in ["完成", "总结", "已经", "成功", "失败"])
                     if is_final:
                         yield event.plain_result(f"🏁 任务总结:\n{content}")
                     else:
                         yield event.plain_result(f"💡 Agent：{content}")
 
-            # 4. 保存当前运行产生的对话历史
+            # 4. 保存对话历史
             current_msgs = agent_runner.run_context.messages
-            new_history = []
-            for msg in current_msgs:
-                if msg.role in ["user", "assistant"]:
-                    content = msg.content
-                    if isinstance(content, list):
-                        text = " ".join([part.text if hasattr(part, 'text') else str(part) for part in content])
-                    else:
-                        text = str(content) if content else ""
-                    if text:
-                        new_history.append({"role": msg.role, "content": text})
-
-            # 限制历史轮数
+            new_history = [{"role": m.role, "content": (m.content[0].text if isinstance(m.content, list) else str(m.content))} 
+                           for m in current_msgs if m.role in ["user", "assistant"]]
+            
             max_turns = config.get("history_max_turns", 10)
-            if len(new_history) > max_turns * 2:
-                new_history = new_history[-(max_turns * 2):]
-
+            if len(new_history) > max_turns * 2: new_history = new_history[-(max_turns * 2):]
             await self.put_kv_data(history_key, new_history)
 
         except Exception as e:
@@ -214,9 +201,9 @@ class ServerOpsPlugin(Star):
     async def ops_clear(self, event: AstrMessageEvent):
         """清空当前运维会话的历史记忆。"""
         user_id = event.get_sender_id()
-        history_key = f"history_{user_id}"
+        history_key = f"ops_history_{user_id}"
         await self.put_kv_data(history_key, [])
-        yield event.plain_result("✅ 运维会话记忆已清空。")
+        yield event.plain_result("✅ 运维对话隔离记忆已清空。")
 
     @filter.command("ops_test")
     async def ops_test(self, event: AstrMessageEvent):
@@ -323,10 +310,8 @@ class ServerOpsPlugin(Star):
     async def ops_log(self, event: AstrMessageEvent):
         """查看并渲染当前会话的历史操作记录。"""
         logger.debug(f"Ops_log triggered with message: {event.message_str}")
-        # yield event.plain_result("DEBUG: ops_log hit") # 调试用
-        config = await self._get_ops_config()
         user_id = event.get_sender_id()
-        history_key = f"history_{user_id}"
+        history_key = f"ops_history_{user_id}"
         history_data = await self.get_kv_data(history_key, [])
         
         if not history_data:
@@ -342,5 +327,34 @@ class ServerOpsPlugin(Star):
         img_url = await self.html_render(self._render_vs_code_style(f"🕒 Session History", log_content, str(user_id)), {})
         yield event.image_result(img_url)
 
-    async def terminate(self):
-        self.ssh_mgr = None
+    @filter.command("ops_skills")
+    async def ops_skills(self, event: AstrMessageEvent):
+        """列出所有已学到的运维技能。"""
+        skills = await self.get_kv_data("ops_skills", {})
+        if not skills:
+            yield event.plain_result("🧠 目前还没有学习到任何技能。你可以通过 /ops 指令让 Agent 学习。")
+            return
+        
+        content = ""
+        for name, detail in skills.items():
+            content += f"### {name}\n{detail}\n\n"
+        
+        img_url = await self.html_render(self._render_vs_code_style("🧠 已学技能库", content, "Skill Memory"), {})
+        yield event.image_result(img_url)
+
+    @filter.command("ops_forget")
+    async def ops_forget(self, event: AstrMessageEvent):
+        """忘掉某个已学的技能。用法：/ops_forget <技能名>"""
+        name = re.sub(r'^([/*!]\s*)?ops_forget\s*', '', event.message_str, flags=re.IGNORECASE).strip()
+        if not name:
+            yield event.plain_result("请输入要忘掉的技能名称。")
+            return
+        
+        skills = await self.get_kv_data("ops_skills", {})
+        if name in skills:
+            del skills[name]
+            await self.put_kv_data("ops_skills", skills)
+            yield event.plain_result(f"✅ 已从记忆中移除技能：{name}")
+        else:
+            yield event.plain_result(f"⚠️ 找不到名为 '{name}' 的技能。")
+

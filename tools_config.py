@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, List
 from pydantic import Field, ConfigDict
 from pydantic.dataclasses import dataclass
 from astrbot.core.agent.run_context import ContextWrapper
@@ -169,4 +169,158 @@ class WriteFileTool(FunctionTool[AstrAgentContext]):
         filepath = kwargs.get("filepath")
         content = kwargs.get("content")
         res = await ssh_mgr.write_file(filepath, content)
+        return res
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class RenderOutputTool(FunctionTool[AstrAgentContext]):
+    """执行命令并将结果渲染为图片发送给用户。"""
+    ssh_mgr: AsyncSSHManager = None
+    plugin: Any = None # ServerOpsPlugin instance
+    name: str = "render_output"
+    description: str = (
+        "执行命令并将输出渲染为图片发送给用户。"
+        "当你认为输出内容较多、格式敏感（如目录树、代码、多行日志）或用户要求截图时使用。"
+        "支持渲染模式：tree (目录树), log (多行日志), plain (普通文本)。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要执行的命令，如 'ls -R' 或 'tail -n 100 /var/log/syslog'",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "图片的标题，如 '目录结构' 或 'Nginx 日志'",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["tree", "log", "plain"],
+                    "description": "渲染模式",
+                }
+            },
+            "required": ["command", "title", "mode"],
+        }
+    )
+
+    async def call(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        **kwargs,
+    ) -> ToolExecResult:
+        if not self.ssh_mgr or not self.plugin:
+            return "SSH or Plugin context not initialized."
+        
+        command = kwargs.get("command")
+        title = kwargs.get("title")
+        mode = kwargs.get("mode")
+        event = context.context.event
+        
+        status, stdout, stderr = await self.ssh_mgr.execute_command(command)
+        content = stdout if status == 0 else f"Err ({status}):\n{stderr}"
+        
+        if not content.strip():
+            return "命令执行成功，但输出为空，未进行渲染。"
+
+        # 根据模式处理内容
+        subtitle = "Command Output"
+        if mode == "tree":
+             # 简单的 tree 模拟处理：为每一行添加图标
+             lines = content.strip().split('\n')
+             formatted_list = ""
+             for line in lines:
+                if not line: continue
+                if line.endswith('/') or '/' in line[:5]:
+                    formatted_list += f"<span style='color: #dcb67a;'>📁 {line}</span>\n"
+                else:
+                    formatted_list += f"<span style='color: #d4d4d4;'>📄 {line}</span>\n"
+             content = formatted_list
+             subtitle = "Directory Tree"
+        elif mode == "log":
+             # 日志样式：角色着色
+             lines = content.strip().split('\n')
+             log_content = ""
+             for line in lines:
+                 if "err" in line.lower() or "fail" in line.lower():
+                     log_content += f"<div style='color: #f48771;'>{line}</div>"
+                 elif "warn" in line.lower():
+                     log_content += f"<div style='color: #cca700;'>{line}</div>"
+                 else:
+                     log_content += f"<div>{line}</div>"
+             content = log_content
+             subtitle = "Log Viewer"
+
+        html = self.plugin._render_vs_code_style(title, content, subtitle)
+        img_url = await self.plugin.html_render(html, {})
+        await event.send(event.image_result(img_url))
+        
+        return f"已成功将 '{title}' 的结果渲染为图片并发送至用户。"
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class LearnSkillTool(FunctionTool[AstrAgentContext]):
+    """让 Agent 学习并记住一项操作技能。"""
+    plugin: Any = None
+    name: str = "learn_skill"
+    description: str = (
+        "学习并记住一项操作技能。当你完成了一个复杂任务，或者用户要求你'记住'某个操作时使用。"
+        "这些记忆将在未来的对话中为你提供参考，直接告诉你如何执行特定任务。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "技能名称，如 '检查Nginx配置' 或 '重启Docker容器'",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "技能的详细执行步骤、命令或注意事项（Markdown格式）",
+                }
+            },
+            "required": ["skill_name", "content"],
+        }
+    )
+
+    async def call(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        **kwargs,
+    ) -> ToolExecResult:
+        if not self.plugin: return "Plugin context not initialized."
+        
+        name = kwargs.get("skill_name")
+        content = kwargs.get("content")
+        
+        skills = await self.plugin.get_kv_data("ops_skills", {})
+        skills[name] = content
+        await self.plugin.put_kv_data("ops_skills", skills)
+        
+        return f"技能 '{name}' 已成功存入我的长期记忆。下次你询问相关任务时我将能直接应用此知识。"
+
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ListSkillsTool(FunctionTool[AstrAgentContext]):
+    """查看已记录的技能列表。"""
+    plugin: Any = None
+    name: str = "list_skills"
+    description: str = "如果你不确定自己学过哪些技能，可以使用此工具查看记忆库中的所有技能名称。"
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+
+    async def call(
+        self,
+        context: ContextWrapper[AstrAgentContext],
+        **kwargs,
+    ) -> ToolExecResult:
+        if not self.plugin: return "Plugin context not initialized."
+        skills = await self.plugin.get_kv_data("ops_skills", {})
+        if not skills:
+            return "我的记忆库目前是空的，没有已学习的技能。"
+        
+        res = "我已学习的技能列表：\n"
+        for i, name in enumerate(skills.keys(), 1):
+            res += f"{i}. {name}\n"
         return res

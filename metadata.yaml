@@ -1,6 +1,6 @@
 name: astrbot_plugin_server_ops
 display_name: Server Ops Agent
-desc: 一个通过自然语言进行服务器运维的 AI Agent 插件。
-version: v1.0.0
+desc: 基于 LLM 的远程服务器运维 Agent，支持可视化截图及 Skill 学习。
+version: v1.1.0
 author: bvzrays
 repo: https://github.com/bvzrays/astrbot_plugin_server_ops
