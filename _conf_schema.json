@@ -1,0 +1,72 @@
+{
+    "ssh_host": {
+        "description": "服务器 IP 或域名",
+        "type": "string",
+        "default": "127.0.0.1"
+    },
+    "ssh_port": {
+        "description": "SSH 端口",
+        "type": "int",
+        "default": 22
+    },
+    "ssh_username": {
+        "description": "SSH 用户名",
+        "type": "string",
+        "default": "root"
+    },
+    "ssh_password": {
+        "description": "SSH 密码（若使用密码登录）",
+        "type": "string",
+        "default": ""
+    },
+    "ssh_key_path": {
+        "description": "SSH 私钥文件绝对路径（若使用私钥登录）",
+        "type": "string",
+        "default": ""
+    },
+    "ssh_key_passphrase": {
+        "description": "私钥密码（若私钥已加密）",
+        "type": "string",
+        "default": ""
+    },
+    "max_steps": {
+        "description": "Agent 最大工具执行步数（防止无限循环）",
+        "type": "int",
+        "default": 15
+    },
+    "cmd_default_timeout": {
+        "description": "普通 Shell 命令的超时时间（秒）",
+        "type": "int",
+        "default": 30
+    },
+    "install_timeout": {
+        "description": "软件安装命令的超时时间（秒），适用于 install_package 工具",
+        "type": "int",
+        "default": 600
+    },
+    "output_max_chars": {
+        "description": "工具返回内容的最大字符数（超出部分截断）",
+        "type": "int",
+        "default": 3000
+    },
+    "show_thought": {
+        "description": "是否展示 Agent 每步的思考过程",
+        "type": "bool",
+        "default": true
+    },
+    "allowed_users": {
+        "description": "允许使用的用户 ID 白名单（英文逗号分隔，空=仅管理员）",
+        "type": "string",
+        "default": ""
+    },
+    "history_max_turns": {
+        "description": "持续会话记忆的最多对话轮数",
+        "type": "int",
+        "default": 10
+    },
+    "render_file_as_image": {
+        "description": "/ops_cat 命令是否将文件内容渲染为图片（关闭则发纯文字）",
+        "type": "bool",
+        "default": true
+    }
+}
