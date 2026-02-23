@@ -1,4 +1,4 @@
-# AstrBot Server Ops Agent (v1.2.0)
+# 被AI史山气晕了，暂时搁置插件
 
 基于 LLM 的远程服务器运维助手，通过自然语言对话即可实现复杂的 Linux 服务器管理。
 
